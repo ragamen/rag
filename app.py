@@ -509,14 +509,14 @@ class DeepSeekUI:
                         st.warning("No se han subido archivos.")
             
             # Verificación de metadata_map
-            """
-            with st.expander("🔍 Verificar metadata_map"):
-                if st.button("Verificar Estructura de metadata_map"):
-                    if not isinstance(st.session_state.state.metadata_map, dict):
-                        st.error("metadata_map no es un diccionario.")
-                    else:
-                        st.write("Estructura de metadata_map:", st.session_state.state.metadata_map)
-            """
+            #"""
+            #with st.expander("🔍 Verificar metadata_map"):
+            #    if st.button("Verificar Estructura de metadata_map"):
+            #        if not isinstance(st.session_state.state.metadata_map, dict):
+            #            st.error("metadata_map no es un diccionario.")
+            #        else:
+            #            st.write("Estructura de metadata_map:", st.session_state.state.metadata_map)
+            #"""
 
             with st.expander("🔍 Opciones de Búsqueda"):
                 self.search_type = st.radio(
