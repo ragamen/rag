@@ -26,7 +26,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import re
+import os
+from dotenv import load_dotenv
+load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+# st.error(f"Clave Api key {DEEPSEEK_API_KEY}")
+
 # Configuración inicial
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -504,13 +509,15 @@ class DeepSeekUI:
                         st.warning("No se han subido archivos.")
             
             # Verificación de metadata_map
+            """
             with st.expander("🔍 Verificar metadata_map"):
                 if st.button("Verificar Estructura de metadata_map"):
                     if not isinstance(st.session_state.state.metadata_map, dict):
                         st.error("metadata_map no es un diccionario.")
                     else:
                         st.write("Estructura de metadata_map:", st.session_state.state.metadata_map)
-            
+            """
+
             with st.expander("🔍 Opciones de Búsqueda"):
                 self.search_type = st.radio(
                     "Modo de búsqueda:",
@@ -606,7 +613,7 @@ class DeepSeekUI:
          
     def _validate_response(self, response, context):
         validation_prompt = f"""
-        Evalúa la siguiente respuesta basada en el contexto proporcionado:
+        Utilice los siguientes fragmentos de contexto para responder a la pregunta al final. Si no sabe la respuesta, simplemente diga que no la sabe, no intente inventar una respuesta.
         
         **Respuesta:**
         {response}
