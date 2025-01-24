@@ -1,7 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message="Tried to instantiate class '__path__._path'")
-import os
 import json
 import requests
 import numpy as np
@@ -17,18 +16,12 @@ from docx import Document
 from docx.table import Table
 from docx.document import Document as DocxDocument
 from docx.text.paragraph import Paragraph  # Importar Paragraph
-from io import BytesIO
-from functools import lru_cache
-import time
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import faiss
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import re
-import os
-from dotenv import load_dotenv
-#load_dotenv()
 try:
     # Intenta acceder a la clave secreta
     DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
