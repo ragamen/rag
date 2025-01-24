@@ -25,7 +25,7 @@ import re
 try:
     # Intenta acceder a la clave secreta
     DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
-    st.write(f"Tu clave API es: {DEEPSEEK_API_KEY}")
+    #st.write(f"Tu clave API es: {DEEPSEEK_API_KEY}")
 except KeyError:
     st.error("La clave API no está configurada. Por favor, verifica el archivo secrets.toml.")
 
