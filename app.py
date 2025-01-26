@@ -22,6 +22,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import re
+from supabase_manager import SupabaseManager
+#embedder = SentenceTransformer('all-MiniLM-L6-v2')
 try:
     # Intenta acceder a la clave secreta
     DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
@@ -38,35 +40,110 @@ embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
 class SessionState:
     def __init__(self):
-        dimension = 384
-        index = faiss.IndexFlatL2(dimension)
-        self.faiss_index = faiss.IndexIDMap(index)
+        # Configuración FAISS (In-memory)
+        self.faiss_index = faiss.IndexFlatL2(384)
+        self.faiss_index = faiss.IndexIDMap(self.faiss_index)
+        
+        # Conexión Supabase (Persistencia)
+        self.supabase = SupabaseManager()
+        
+        # Metadata y estado
         self.metadata_map = {}
         self.document_store = defaultdict(list)
         self.chat_history = []
         self.uploaded_files = []
-        self.current_page = None  # Nueva variable para seguimiento de página
-        # Verificación inicial
+        
+        # Verificación opcional (si se usa metadata_map)
         if not isinstance(self.metadata_map, dict):
             raise TypeError("metadata_map debe ser un diccionario.")
 
 def init_session():
     if 'state' not in st.session_state:
         st.session_state.state = SessionState()
-
+        
+        # Cargar datos existentes de Supabase a FAISS
+        try:
+            documentos = st.session_state.state.supabase.client.table('documentos').select("embedding,id").execute().data
+            
+            for doc in documentos:
+                # Convertir cadena a lista de floats
+                embedding_list = eval(doc["embedding"])  # ✅ Convertir string a lista
+                embedding_array = np.array(embedding_list, dtype=np.float32).reshape(1, -1)
+                st.session_state.state.faiss_index.add_with_ids(embedding_array, np.array([doc["id"]]))
+                
+        except Exception as e:
+            st.error(f"Error inicializando FAISS desde Supabase: {str(e)}")
 
 
 def extract_metadata_from_filename(filename):
     # Ejemplo: "Bravo-Santillana_2021_Tesis.pdf"
-    pattern = r"^(?P<author>[^_]+)_(?P<year>\d{4})_(?P<title>.+)\.pdf$"
-    match = re.match(pattern, filename)
-    if match:
-        return match.groupdict()
-    return {"author": "Desconocido", "year": "N/A", "title": filename}
+    patterns = [
+        r"(?P<author>[A-Za-z-]+)_(?P<year>\d{4})_(?P<title>.+?)(\.[^.]+)?$",
+        r"(?P<title>.+?)_(?P<author>[A-Za-z-]+)_(?P<year>\d{4})"
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, filename)
+        if match:
+            return {
+                "author": match.group("author").replace("-", " "),
+                "year": match.group("year"),
+                "title": match.group("title").replace("_", " ")
+            }
+    
+    # Fallback para nombres no estructurados
+    return {
+        "author": "Desconocido",
+        "year": datetime.now().year,
+        "title": filename.rsplit('.', 1)[0]
+    }
 
 def generate_doc_id(file_name, chunk_index):
     hash_object = hashlib.sha256(f"{file_name}_{chunk_index}".encode())
     return struct.unpack('>q', hash_object.digest()[:8])[0]
+
+def generate_content_hash(texto: str) -> str:
+    """Genera un hash único SHA-256 del contenido del texto."""
+    texto_limpio = texto.strip().lower().encode('utf-8')
+    return hashlib.sha256(texto_limpio).hexdigest()
+
+class PageAwareTextSplitter(RecursiveCharacterTextSplitter):
+    def __init__(self, chunk_size, chunk_overlap, separators, page_ranges):
+        super().__init__(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=separators
+        )
+        self.page_ranges = page_ranges
+        
+    def split_text(self, text):
+        chunks = super().split_text(text)
+        chunk_pages = []
+        
+        # Mapeo de posiciones a páginas
+        page_map = []
+        for p_start, p_end, p_num in self.page_ranges:
+            page_map.extend([(pos, p_num) for pos in range(p_start, p_end)])
+        
+        for chunk in chunks:
+            start = text.find(chunk)
+            end = start + len(chunk)
+            pages = set()
+            
+            # Determinar páginas cubiertas
+            for pos in range(start, end):
+                if pos < len(page_map):
+                    pages.add(page_map[pos][1])
+            
+            chunk_pages.append({
+                "text": chunk,
+                "pages": sorted(pages),
+                "start_char": start,
+                "end_char": end
+            })
+            
+        return chunk_pages
+    
 
 class DocumentProcessor:
     def __init__(self):
@@ -102,62 +179,132 @@ class DocumentProcessor:
 
     def process_file(self, file):
         try:
+            # Generar hash del contenido completo
+            full_content = self._extract_full_content(file)
+            doc_hash = generate_content_hash(full_content)
+            if st.session_state.state.supabase.is_document_processed(doc_hash):
+                st.warning(f"Documento ya procesado: {file.name}")
+                return False 
+
+            # Validación inicial del archivo
             if file is None or file.size == 0:
-                st.error(f"Archivo inválido: {file.name}")
-                return False
+                raise ValueError("Archivo inválido o vacío")
 
-            metadata = self._extract_metadata(file)
-            text, page_numbers = self._extract_text_from_pdf(file)  # Extrae texto y números de página
-            chunks = self.text_splitter.split_text(text)
+            # Extracción y validación de contenido
+            text, page_data = "", []
             
-            embeddings = self._get_embeddings(chunks)
+            if file.name.endswith('.pdf'):
+                text, page_ranges = self._extract_text_from_pdf(file)
+                page_numbers = [p[2] for p in page_ranges]
+                
+                # Inicializar splitter corregido
+                splitter = PageAwareTextSplitter(
+                    chunk_size=1500,
+                    chunk_overlap=100,
+                    separators=["\n\n", "\n", ". ", "? ", "! ", " "],
+                    page_ranges=page_ranges
+                )
+                
+                chunk_data = splitter.split_text(text)
 
-            for idx, (chunk, embed) in enumerate(zip(chunks, embeddings)):
-                # Determina las páginas correspondientes al chunk
-                start_page = page_numbers[0] if page_numbers else None
-                end_page = page_numbers[-1] if page_numbers else None
+            elif file.name.endswith('.docx'):
+                text = self._extract_text_from_docx(file)
+                page_numbers = [1]  # Placeholder para DOCX
+                chunk_data = [{"text": chunk, "pages": [1]} for chunk in self.text_splitter.split_text(text)]
+            else:
+                raise ValueError("Formato de archivo no soportado")
 
-                # Verificar que el chunk esté contenido en las páginas
-                if start_page and end_page:
-                    page_text = self.extract_text_from_pages(file, start_page, end_page)
-                    if chunk not in page_text:
-                        st.warning(f"El chunk {idx} no está completamente contenido en las páginas {start_page}-{end_page}.")
+            if not text.strip() or len(text) < 100:
+                raise ValueError("Documento sin texto legible o demasiado corto")
 
+            # Insertar en tabla fuentes
+            metadata = self._extract_metadata(file)
+            fuente_id = st.session_state.state.supabase.insert_fuente(
+                metadata={
+                    "title": metadata.get("title", file.name),
+                    "author": metadata.get("author", "Desconocido"),
+                    "paginas_total": len(page_numbers),
+                    "anio_publicacion": datetime.now().year,
+                    "categoria": metadata.get("categoria", "General")
+                },
+                content_hash=doc_hash
+            )
+
+            # Procesamiento del texto
+            if not chunk_data:
+                raise ValueError("No se pudieron generar fragmentos válidos")
+
+            embeddings = self._get_embeddings([chunk["text"] for chunk in chunk_data])
+
+            # Procesamiento de cada chunk
+            for idx, (chunk_info, embed) in enumerate(zip(chunk_data, embeddings)):
+                chunk = chunk_info["text"]
+                pages = chunk_info["pages"]
+                
+                # Generación de metadatos
                 doc_id = generate_doc_id(file.name, idx)
-                
                 chunk_metadata = {
-                    "doc_id": doc_id,
-                    "content": chunk,  # Texto sin números de página
-                    "embedding": embed,
                     "source": file.name,
-                    "timestamp": datetime.now().isoformat(),
-                    "semantic_tags": self._generate_semantic_tags(chunk),
-                    "metadata": {
-                        **metadata,
-                        "pages": f"{start_page}-{end_page}" if start_page != end_page else str(start_page)
-                    }
+                    "pages": f"{pages[0]}-{pages[-1]}" if len(pages) > 1 else str(pages[0]),
+                    "exact_pages": pages,
+                    "start_char": chunk_info.get("start_char", 0),
+                    "end_char": chunk_info.get("end_char", 0),
+                    "author": metadata.get("author", "Desconocido"),
+                    "year": datetime.now().year,
+                    "doc_id": doc_id
                 }
-                
-                # Verificación de la estructura de chunk_metadata
-                required_keys = ["doc_id", "content", "embedding", "source", "timestamp", "semantic_tags", "metadata"]
-                if not all(key in chunk_metadata for key in required_keys):
-                    raise ValueError(f"Falta una clave requerida en chunk_metadata: {chunk_metadata}")
-                
+
+                # Validación de integridad
+                if file.name.endswith('.pdf'):
+                    if not self.validate_chunk_integrity(file, chunk, pages):
+                        st.warning(f"Chunk {idx} no coincide con las páginas {pages}")
+
+                # Insertar en Supabase
+                st.session_state.state.supabase.insert_document(
+                    fuente_id=fuente_id,
+                    content_hash=generate_content_hash(chunk),
+                    contenido=chunk,
+                    embedding=embed.tolist(),
+                    metadata=chunk_metadata
+                )
+
+                # Actualización del almacenamiento
                 st.session_state.state.metadata_map[doc_id] = chunk_metadata
                 st.session_state.state.document_store[file.name].append(doc_id)
 
-                # Actualizar FAISS
-                embeddings_array = np.array([embed], dtype=np.float32)
-                ids_array = np.array([doc_id], dtype=np.int64)
-                st.session_state.state.faiss_index.add_with_ids(embeddings_array, ids_array)
+                # Actualización de FAISS
+                st.session_state.state.faiss_index.add_with_ids(
+                    np.array([embed], dtype=np.float32),
+                    np.array([doc_id], dtype=np.int64)
+                )
 
-            st.success(f"Documento procesado: {metadata['title']}")
-            st.write(f"Páginas procesadas: {len(page_numbers)}")
+            st.success(f"Documento procesado: {metadata.get('title', file.name)}")
+            st.write(f"Chunks generados: {len(chunk_data)} | Páginas procesadas: {len(page_numbers)}")
             return True
-        except Exception as e:
-            st.error(f"Error procesando archivo: {str(e)}")
-            return False
 
+        except Exception as e:
+            error_details = f"""
+            Error procesando {file.name if file else 'archivo'}:
+            {str(e)}
+            - Tipo archivo: {getattr(file, 'type', 'desconocido')}
+            - Tamaño: {getattr(file, 'size', 0)} bytes
+            """
+            st.error(error_details)
+            return False
+        
+    def _extract_full_content(self, file) -> str:
+        """Extrae todo el contenido de un archivo para generar el hash único"""
+        try:
+            if file.name.endswith('.pdf'):
+                text, _ = self._extract_text_from_pdf(file)
+                return text
+            elif file.name.endswith('.docx'):
+                return self._extract_text_from_docx(file)
+            else:
+                raise ValueError("Formato no soportado")
+        except Exception as e:
+            st.error(f"Error extrayendo contenido completo: {str(e)}")
+            return ""
     def _extract_metadata(self, file):
         if file.name.endswith('.pdf'):
             return self._extract_pdf_metadata(file)
@@ -165,6 +312,7 @@ class DocumentProcessor:
             return self._extract_docx_metadata(file)
         else:
             return {
+                "categoria": "General",
                 "title": file.name,
                 "author": "Desconocido",
                 "creation_date": "N/A",
@@ -175,6 +323,8 @@ class DocumentProcessor:
     def _extract_pdf_metadata(self, file):
         """Extrae metadatos de PDFs con soporte para campos vacíos."""
         try:
+
+            file.seek(0)  # ¡Importante! Resetear el puntero del archivo
             doc = fitz.open(stream=file.read(), filetype="pdf")
             metadata = doc.metadata
             
@@ -189,6 +339,7 @@ class DocumentProcessor:
         except Exception as e:
             st.error(f"Error extrayendo metadatos PDF: {str(e)}")
             return {
+                "categoria": "General",
                 "title": "Desconocido",
                 "author": "Desconocido",
                 "creation_date": "N/A",
@@ -222,23 +373,44 @@ class DocumentProcessor:
             }
 
     def _extract_text_from_pdf(self, file):
-        """Extrae texto de un archivo PDF y registra los números de página en los metadatos."""
         try:
-            file.seek(0)  # Reinicia el puntero del archivo al inicio
+            file.seek(0)
             doc = fitz.open(stream=file.read(), filetype="pdf")
             full_text = []
-            page_numbers = []  # Almacena los números de página
+            page_ranges = []
 
-            for page_num, page in enumerate(doc):
+            current_pos = 0
+            for page_num in range(len(doc)):  # Usar índice de página real
+                page = doc.load_page(page_num)
                 text = page.get_text()
                 full_text.append(text)
-                page_numbers.append(page_num + 1)  # Los números de página comienzan en 1
+                end_pos = current_pos + len(text)
+                page_ranges.append((
+                    current_pos, 
+                    end_pos, 
+                    page_num + 1  # Páginas base 1 para el usuario
+                ))
+                current_pos = end_pos + 1  # +1 para separador
 
-            return "\n".join(full_text), page_numbers
+            return "\n".join(full_text), page_ranges
         except Exception as e:
             st.error(f"Error extrayendo texto PDF: {str(e)}")
             return "", []
-
+          
+    def validate_chunk_integrity(self, file, chunk_text, exact_pages):
+        """Verificación precisa usando posiciones caracter"""
+        try:
+            file.seek(0)
+            doc = fitz.open(stream=file.read(), filetype="pdf")
+            full_page_text = ""
+            for page_num in exact_pages:
+                full_page_text += doc.load_page(page_num - 1).get_text()
+                
+            return chunk_text in full_page_text
+        except Exception as e:
+            st.error(f"Error validando chunk: {str(e)}")
+            return False
+             
     def _extract_text_from_docx(self, file):
         """Extrae texto de DOCX con manejo de formatos complejos."""
         try:
@@ -310,94 +482,91 @@ class DocumentProcessor:
             
 # Clase ChatManager
 class ChatManager:
-    def __init__(self):
-        self.vectorizer = TfidfVectorizer(stop_words='english')
-        self.similarity_threshold = 0.82  # Más estricto
-        self.min_chunk_length = 150  # Ignorar chunks cortos    
+    def __init__(self, embedder: SentenceTransformer, supabase_client):
+        self.embedder = embedder
+        self.supabase = supabase_client  # <-- Recibir y almacenar Supabase
+        self.vectorizer = TfidfVectorizer(stop_words='spanish')
+        self.similarity_threshold = 0.82
+        self.min_chunk_length = 150
 
+# Versión CORREGIDA (app.py)
     def hybrid_search(self, query, top_k=5):
         try:
-            # Búsqueda vectorial con FAISS
-            query_embed = embedder.encode([query])[0]
-            D, I = st.session_state.state.faiss_index.search(
-                np.array([query_embed], dtype=np.float32), 
-                top_k * 2
-            )
-            faiss_ids = I[0].tolist()
-
-            # Búsqueda léxica con TF-IDF
-            corpus = []
-            id_map = []  # Mapeo de índices a IDs reales
-            for doc_id, metadata in st.session_state.state.metadata_map.items():
-                # Verificación de la estructura de metadata
-                required_keys = ["content", "source", "metadata", "semantic_tags"]
-                if not all(key in metadata for key in required_keys):
-                    raise ValueError(f"Falta una clave requerida en metadata: {metadata}")
-                
-                corpus.append(metadata['content'])
-                id_map.append(doc_id)
+            # Búsqueda Vectorial
+            query_embed = self.embedder.encode([query])[0]
+            vector_results = self.supabase.search_documents(query_embed, top_k)
             
-            if corpus:
-                tfidf_matrix = self.vectorizer.fit_transform(corpus)
-                query_vec = self.vectorizer.transform([query])
-                doc_scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
-                lexical_ids = [id_map[i] for i in np.argsort(doc_scores)[-top_k * 2:][::-1]]
-            else:
-                lexical_ids = []
-
-            # Combinar y priorizar resultados
-            combined_ids = list(set(faiss_ids + lexical_ids))
+            # Búsqueda Léxica - Versión CORREGIDA
+            lexical_response = self.supabase.client.rpc(
+                'search_lexical',
+                {
+                    'query_text': query,
+                    'top_k': top_k
+                }
+            ).execute()
             
-            # Recuperar metadatos y ordenar por relevancia
-            results = []
-            for doc_id in combined_ids:
-                if doc_id in st.session_state.state.metadata_map:
-                    metadata = st.session_state.state.metadata_map[doc_id]
-                    results.append(metadata)
+            # Normalizar resultados léxicos
+            lexical_results = []
+            for item in lexical_response.data:
+                lexical_results.append({
+                    "id": item["id"],
+                    "contenido": item["contenido"],
+                    "metadata": item["metadata"],
+                    "similarity": 0.7  # Valor por defecto para compatibilidad
+                })
             
-            # Ordenar por puntaje combinado (simulación)
-            results = sorted(results, 
-                key=lambda x: len(x['semantic_tags']), 
-                reverse=True
-            )[:top_k]
-
-            return results
-        except Exception as e:
-            st.error(f"Error en búsqueda: {str(e)}")
-            return []  
+            # Combinar y ordenar resultados
+            combined_results = vector_results + lexical_results
+            return sorted(combined_results, 
+                        key=lambda x: x.get('similarity', 0), 
+                        reverse=True)[:top_k]
         
-    def generate_response(self, query, context, sources):
+        except Exception as e:
+            st.error(f"Error en búsqueda híbrida: {str(e)}")
+            return []
+# Versión CORREGIDA (app.py)
+    def generate_response(self, query, results):
         try:
-            # Depuración: Verifica la estructura de `sources`
-            # st.write("Estructura de sources:", sources)  # Muestra la estructura de sources
+            if not results:
+                return "No se encontraron resultados relevantes.", []
+
+            # Paso 1: Procesar metadatos y construir contexto
+            source_map = {}  # (autor, título, año) -> {datos}
+            context_parts = []
+            source_counter = 1  # <-- Nombre de variable corregido
             
-            # Asegúrate de que `sources` sea una lista de diccionarios
-            if not isinstance(sources, list) or not all(isinstance(src, dict) for src in sources):
-                raise ValueError("La estructura de 'sources' es inválida. Debe ser una lista de diccionarios.")
-            
-            # Agrupar fuentes por autor, título y año
-            grouped_sources = defaultdict(list)
-            for src in sources:
-                metadata = extract_metadata_from_filename(src.get("source", "Desconocido"))
-                key = (metadata["author"], metadata["title"], metadata["year"])
-                grouped_sources[key].append(src)
-            
-            # Formatear las fuentes agrupadas
-            formatted_sources = []
-            for (author, title, year), src_list in grouped_sources.items():
-                pages = set()
-                tags = set()
-                for src in src_list:
-                    pages.add(src.get("metadata", {}).get("pages", "N/A"))
-                    tags.update(src.get("semantic_tags", []))
-                
-                formatted_sources.append(
-                    f"{author} ({year}). {title}. "
-                    f"Páginas: {', '.join(sorted(pages))}. "
-                    f"Etiquetas: {', '.join(sorted(tags)[:3])}"
+            for res in results:  # <-- ¡Atención a la indentación!
+                meta = res.get('metadata', {})
+                key = (
+                    meta.get('author', 'Desconocido'),
+                    meta.get('title', 'Sin título'),
+                    meta.get('year', 'N/A')
                 )
-            
-            # Generar la respuesta usando la API de DeepSeek
+                
+                if key not in source_map:
+                    # Extraer páginas exactas
+                    pages = meta.get('exact_pages', [])
+                    if not pages:  # Si no hay páginas, usar las del documento completo
+                        pages = list(range(1, meta.get('paginas_total', 1) + 1))
+                    
+                    source_map[key] = {
+                        'number': source_counter,  # <-- Usar source_counter
+                        'author': key[0],
+                        'title': key[1],
+                        'year': key[2],
+                        'pages': sorted(set(pages))  # Eliminar duplicados y ordenar
+                    }
+                    source_counter += 1  # <-- Incrementar contador
+                    
+                # Construir contexto con cita
+                current_source = source_map[key]
+                context_parts.append(
+                    f"[{current_source['number']}] {current_source['title']} "
+                    f"(Páginas {', '.join(map(str, current_source['pages']))})\n"
+                    f"{res.get('contenido', '')}"
+                )
+
+            # Paso 2: Generar respuesta con el modelo (FUERA del bucle for)
             response = requests.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 headers={
@@ -408,212 +577,267 @@ class ChatManager:
                     "model": "deepseek-chat",
                     "messages": [{
                         "role": "system",
-                        "content": f"Contexto con páginas:\n{context}\nResponde profesionalmente citando páginas."
+                        "content": "Contexto con citas entre corchetes:\n"  # Parte 1
+                                + "\n\n".join(context_parts)  # Parte 2 
+                                + "\nResponde usando citas como [n]."  # Parte 3
                     }, {
                         "role": "user",
                         "content": query
                     }]
                 }
             )
-            
+
+            # Paso 3: Formatear fuentes finales
+            formatted_sources = []
+            for key in sorted(source_map.keys(), key=lambda x: source_map[x]['number']):
+                data = source_map[key]
+                formatted_sources.append({
+                    "number": data['number'],
+                    "author": key[0],
+                    "title": key[1],
+                    "year": key[2],
+                    "pages": sorted(data['pages'])
+                })
+
+            # Procesar respuesta
             if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"], formatted_sources
-            else:
-                raise Exception(f"API Error: {response.status_code}")
+                response_text = response.json()["choices"][0]["message"]["content"]
+                # Convertir [n] a (n)
+                response_text = re.sub(r'\[(\d+)\]', r'(\1)', response_text)
+                return response_text, formatted_sources
+                
+            raise Exception(f"API Error: {response.status_code}")
                 
         except Exception as e:
-            return f"Error: {str(e)}", []        
-        
+            return f"Error: {str(e)}", [] 
         
 # Interfaz de usuario mejorada
 class DeepSeekUI:
     def __init__(self):
         self.processor = DocumentProcessor()
-        self.chat_manager = ChatManager()
-    
+        # Pasar el cliente Supabase desde el estado de la sesión
+        self.chat_manager = ChatManager(
+            embedder=embedder,
+            supabase_client=st.session_state.state.supabase  # <-- Cliente Supabase
+        )
+        self.supabase = st.session_state.state.supabase
+
     def render_sidebar(self):
         with st.sidebar:
-            st.title("⚙️ Configuración")
+            st.header("📥 **Carga de Documentos**")
             
-            # Botón para cambiar entre modo claro y oscuro
-            dark_mode = st.checkbox("Modo Oscuro")
+            # 1. Sección principal de carga
+            uploaded_files = st.file_uploader(
+                "Subir documentos (PDF/DOCX)",
+                type=["pdf", "docx"],
+                accept_multiple_files=True,
+                help="Máximo 200MB por archivo",
+                key="main_uploader"
+            )
             
-            if dark_mode:
-                st.markdown("""
-                <style>
-                    .main { background-color: #1e1e1e; color: white; }
-                    .stButton>button { background-color: #4CAF50; color: white; }
-                    .response-box { 
-                        border: 2px solid #4CAF50;
-                        border-radius: 5px;
-                        padding: 20px;
-                        margin: 10px 0;
-                        background-color: #2e2e2e;
-                    }
-                    .reference-item { 
-                        margin: 5px 0;
-                        padding: 10px;
-                        background-color: #3e3e3e;
-                        border-radius: 3px;
-                    }
-                </style>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown("""
-                <style>
-                    .main { background-color: #f0f2f6; color: black; }
-                    .stButton>button { background-color: #4CAF50; color: white; }
-                    .response-box { 
-                        border: 2px solid #4CAF50;
-                        border-radius: 5px;
-                        padding: 20px;
-                        margin: 10px 0;
-                        background-color: #ffffff;
-                    }
-                    .reference-item { 
-                        margin: 5px 0;
-                        padding: 10px;
-                        background-color: #e8f5e9;
-                        border-radius: 3px;
-                    }
-                </style>
-                """, unsafe_allow_html=True)
+            # 2. Botón de procesamiento principal
+            if st.button("⚙️ Procesar Documentos", type="primary", key="main_process"):
+                if uploaded_files:
+                    self._handle_file_processing(uploaded_files)
+                else:
+                    st.warning("Debes subir al menos un documento")
             
-            with st.expander("📤 Gestión de Documentos"):
-                uploaded_files = st.file_uploader(
-                    "Subir documentos (PDF/DOCX)",
-                    type=["pdf", "docx"],
-                    accept_multiple_files=True
-                )
-                if st.button("Procesar Documentos", type="primary"):
-                    if uploaded_files:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        for i, file in enumerate(uploaded_files):
-                            status_text.text(f"Procesando {i + 1}/{len(uploaded_files)}: {file.name}")
-                            if file.name not in st.session_state.state.uploaded_files:
-                                try:
-                                    success = self.processor.process_file(file)
-                                    if success:
-                                        st.session_state.state.uploaded_files.append(file.name)
-                                    else:
-                                        st.warning(f"No se pudo procesar el archivo: {file.name}")
-                                except Exception as e:
-                                    st.error(f"Error procesando archivo '{file.name}': {str(e)}")
-                            progress_bar.progress((i + 1) / len(uploaded_files))
-                        
-                        status_text.text("Procesamiento completado.")
-                        st.success("Todos los documentos han sido procesados.")
-                    else:
-                        st.warning("No se han subido archivos.")
-            
-            # Verificación de metadata_map
-            #"""
-            #with st.expander("🔍 Verificar metadata_map"):
-            #    if st.button("Verificar Estructura de metadata_map"):
-            #        if not isinstance(st.session_state.state.metadata_map, dict):
-            #            st.error("metadata_map no es un diccionario.")
-            #        else:
-            #            st.write("Estructura de metadata_map:", st.session_state.state.metadata_map)
-            #"""
-
-            with st.expander("🔍 Opciones de Búsqueda"):
-                self.search_type = st.radio(
-                    "Modo de búsqueda:",
-                    ["Híbrida", "Vectorial", "Semántica"],
-                    index=0
-                )
+            # 3. Gestión avanzada (SIN EXPANDER ANIDADO)
+            with st.expander("🚀 Acciones Avanzadas", expanded=False):
+                col1, col2 = st.columns(2)
                 
-                self.creativity = st.slider(
-                    "Nivel de creatividad:",
-                    min_value=0.0, max_value=1.0, value=0.5,
-                    help="Controla el balance entre precisión y originalidad"
-                )
-        
+                with col1:
+                    # Recarga completa
+                    st.subheader("🔄 Recarga Total")
+                    st.caption("Elimina todo y carga nuevos documentos")
+                    reload_files = st.file_uploader(
+                        "Subir para recarga",
+                        type=["pdf", "docx"],
+                        accept_multiple_files=True,
+                        key="reload_uploader"
+                    )
+                    if st.button("Ejecutar Recarga", type="secondary"):
+                        if reload_files:
+                            try:
+                                st.session_state.state = SessionState()
+                                self._handle_file_processing(reload_files)
+                                st.success("Recarga completada")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {str(e)}")
+                        else:
+                            st.error("Sube archivos primero")
+                
+                with col2:
+                    # Mantenimiento
+                    st.subheader("🧹 Limpieza")
+                    st.caption("Acciones de mantenimiento de la base de datos")
+                    if st.button("Borrar Todos los Documentos", type="secondary"):
+                        try:
+                            st.session_state.state.supabase.client.table('documentos').delete().neq('id', 0).execute()
+                            st.session_state.state.supabase.client.table('fuentes').delete().neq('id', 0).execute()
+                            st.success("Base de datos limpiada")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+            
+            # 4. Sección de diagnóstico
+            with st.expander("📊 Diagnóstico", expanded=False):
+                if st.button("Estadísticas de Documentos"):
+                    self._show_database_stats()
+                
+                if st.button("Última Búsqueda"):
+                    if hasattr(st.session_state, 'last_search_response'):
+                        st.json(st.session_state.last_search_response)
+                    else:
+                        st.write("Sin registros de búsqueda")
+            
+            # 5. Fuentes registradas
+            with st.expander("📚 Fuentes Actuales", expanded=False):
+                fuentes = self.supabase.client.table('fuentes').select("*").order("titulo").execute().data
+                for fuente in fuentes:
+                    st.write(f"**{fuente['titulo']}**  \n*{fuente['autor']} ({fuente['anio_publicacion']})*")
+
     def render_chat(self):
         st.title("🧠 Asistente DeepSeek RAG")
         
-        # Historial de chat
-        chat_container = st.container(height=500)
-        with chat_container:
-            for msg in st.session_state.state.chat_history:
-                self._render_message(msg)
-          
-            # Entrada de usuario
-        query = st.chat_input("Escribe tu pregunta...")
-        if query:
-            self._handle_user_query(query)
+        # Definir el contenedor PRINCIPAL del chat
+        main_chat_container = st.container(height=500)
         
-    def _render_message(self, msg):
-        if msg['type'] == 'user':
-            st.markdown(f"""
-            <div style="margin: 1rem 0; padding: 1rem; 
-                        background: #e3f2fd; border-radius: 10px;
-                        box-shadow: 0 2px 4px rgba(0,0,0,0.1)">
-                <strong>👤 Tú:</strong> {msg['content']}
-            </div>
-            """, unsafe_allow_html=True)
+        with main_chat_container:
+            # Contenedor interno para historial
+            history_container = st.container()
             
-        elif msg['type'] == 'assistant':
-            with st.expander("💡 Respuesta Completa", expanded=True):
+            # Contenedor para nuevos mensajes
+            message_container = st.container()
+            
+            # Mostrar historial existente
+            with history_container:
+                for msg in st.session_state.state.chat_history:
+                    self._render_message(msg)
+            
+            # Procesar nueva consulta
+            query = st.chat_input("Escribe tu pregunta...", key="chat_input")
+            if query:
+                with message_container:
+                    self._handle_user_query(query)
+                st.rerun()
+
+# Versión CORREGIDA (app.py)
+    def _render_message(self, msg):
+        with st.container():
+            if msg['type'] == 'user':
                 st.markdown(f"""
-                <div style="margin: 0.5rem 0; padding: 1rem;
-                            background: #f5f5f5; border-radius: 10px;">
-                    <strong>🤖 Asistente:</strong> {msg['content']}
+                <div style='
+                    margin: 1rem 0; 
+                    padding: 1.5rem;
+                    background: #e3f2fd;
+                    border-radius: 10px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                    position: relative;
+                '>
+                    <div style='
+                        position: absolute;
+                        top: -12px;
+                        left: 15px;
+                        background: #2196F3;
+                        color: white;
+                        padding: 4px 12px;
+                        border-radius: 20px;
+                        font-size: 0.85em;
+                    '>
+                        👤 Tú
+                    </div>
+                    {msg['content']}
                 </div>
                 """, unsafe_allow_html=True)
-                    
-                if 'references' in msg:
-                    st.markdown("**🔍 Fuentes Relacionadas:**")
-                    for ref in msg['references']:
+                
+            elif msg['type'] == 'assistant':
+                # Mostrar respuesta principal
+                st.markdown(msg['content'])
+                
+                # Mostrar fuentes si existen
+                if msg.get('sources'):
+                    st.markdown("---")
+                    st.markdown("**Fuentes consultadas:**")
+                    for source in msg['sources']:
                         st.markdown(f"""
-                        <div class="reference-item">
-                            📌 {ref}
+                        <div style='margin: 5px 0; padding: 10px; 
+                            background: #f8f9fa; border-radius: 5px;
+                            border-left: 3px solid #2c3e50;'>
+                            <b>({source['number']})</b> {source['author']} ({source['year']})<br>
+                            <i>{source['title']}</i><br>
+                            Páginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}
                         </div>
                         """, unsafe_allow_html=True)
-    
+
     def _handle_user_query(self, query):
-        st.session_state.state.chat_history.append({
-            'type': 'user',
-            'content': query
-        })
-        
-        with st.spinner("🔍 Buscando información relevante..."):
-            results = self.chat_manager.hybrid_search(query)
+        try:
+            # Obtener resultados de búsqueda
+            results = self.chat_manager.hybrid_search(query) or []
             
-            # Construir el contexto y las fuentes
-            context = "\n\n".join(
-                f"[Fuente: {res['source']}]\n{res['content']}" 
-                for res in results
-            )
-            
-            # Asegurarse de que `sources` sea una lista de diccionarios
-            sources = []
+            # Construir contexto
+            context_parts = []
             for res in results:
-                if isinstance(res, dict):  # Verificar que cada resultado sea un diccionario
-                    sources.append({
-                        "source": res.get("source", "Desconocido"),
-                        "metadata": res.get("metadata", {}),
-                        "semantic_tags": res.get("semantic_tags", [])
-                    })
+                source = res['metadata'].get('source', 'Documento desconocido')
+                pages = res['metadata'].get('exact_pages', [])
+                context_parts.append(
+                    f"📚 **{source}** (Páginas {', '.join(map(str, pages))})\n"
+                    f"{res['contenido']}\n"
+                )
             
-        with st.spinner("💡 Generando respuesta..."):
-            response, response_sources = self.chat_manager.generate_response(query, context, sources)
+            # Generar y mostrar respuesta
+            response, sources = self.chat_manager.generate_response(query, results)
             
+            # Actualizar historial
             st.session_state.state.chat_history.append({
                 'type': 'assistant',
                 'content': response,
-                'references': response_sources,  # Incluye las fuentes en la respuesta
-                'validation': self._validate_response(response, context)
+                'sources': sources
             })
+            
+        except Exception as e:
+            st.error(f"Error procesando consulta: {str(e)}")
         
-        st.rerun()  
+    def highlight_text(self, text, pages):
+        """Resalta contenido con formato académico profesional"""
+        pages_str = ", ".join([f"Pág. {p}" for p in sorted(pages)]) if pages else "Pág. N/A"
         
-         
+        highlighted = f"""
+        <div style='
+            border-left: 2px solid #2c3e50;
+            margin: 15px 0;
+            padding: 12px 20px;
+            background: #f9f9f9;
+            position: relative;
+            font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        '>
+            <div style='
+                color: #2c3e50;
+                font-size: 0.85em;
+                font-weight: 600;
+                margin-bottom: 8px;
+                border-bottom: 1px solid #e0e0e0;
+                padding-bottom: 5px;
+            '>
+                <i class="fas fa-book-open" style="margin-right: 7px;"></i>
+                Referencia: {pages_str}
+            </div>
+            <div style='
+                color: #34495e;
+                line-height: 1.6;
+                font-size: 0.95em;
+                text-align: justify;
+            '>
+                {text}
+            </div>
+        </div>
+        """
+        return highlighted    
+
     def _validate_response(self, response, context):
         validation_prompt = f"""
-        Utilice los siguientes fragmentos de contexto para responder a la pregunta al final. Si no sabe la respuesta, simplemente diga que no la sabe, no intente inventar una respuesta.
+        Utilice solo los siguientes fragmentos de contexto para responder a la pregunta al final. Si la respuesta, no esta ahi, simplemente diga que no la sabe, no intente inventar una respuesta.
         
         **Respuesta:**
         {response}
@@ -646,6 +870,71 @@ class DeepSeekUI:
             return json.loads(validation.json()["choices"][0]["message"]["content"])
         else:
             return {"score": 0, "valid": False, "reasons": ["Error en la validación"]}
+
+    def _show_database_stats(self):
+        """Muestra estadísticas clave de la base de datos"""
+        try:
+            # Acceder a través de self.supabase
+            docs_count = self.supabase.client.table('documentos').select("count", count='exact').execute().count
+            fuentes_count = self.supabase.client.table('fuentes').select("count", count='exact').execute().count
+            
+            st.subheader("📊 Estadísticas del Sistema")
+            col1, col2 = st.columns(2)
+            col1.metric("Documentos (Chunks)", docs_count)
+            col2.metric("Fuentes Únicas", fuentes_count)
+            
+        except Exception as e:
+            st.error(f"Error obteniendo estadísticas: {str(e)}")
+
+    def _handle_file_processing(self, files):
+        """Maneja el procesamiento de archivos en lote con seguimiento visual"""
+        # Inicializar lista de archivos subidos
+        if "uploaded_files" not in st.session_state:
+            st.session_state.uploaded_files = []
+
+        # Configurar elementos de UI
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        try:
+            for i, file in enumerate(files):
+                # Actualizar UI
+                status_text.markdown(f"""
+                    **Procesando:** `{file.name}`  
+                    📏 Tamaño: {file.size/1e6:.1f} MB  
+                    🔖 Tipo: {file.type.split('/')[-1].upper()}
+                """)
+                
+                # Procesar archivo
+                success = self.processor.process_file(file)
+                
+                # Manejar resultados
+                if success:
+                    st.session_state.uploaded_files.append(file.name)
+                    st.success(f"✅ {file.name} procesado correctamente")
+                else:
+                    st.warning(f"⚠️ {file.name} tuvo problemas en el procesamiento")
+                
+                # Actualizar barra de progreso
+                progress_bar.progress((i + 1) / len(files))
+                
+        except Exception as e:
+            st.error(f"""
+                **Error crítico:**  
+                ```python
+                {str(e)}
+                ```
+                🛠️ **Solución:**  
+                - Verifique el formato del archivo  
+                - Asegúrese de no subir archivos protegidos con contraseña  
+                - Revise los logs técnicos
+            """)
+            st.exception(e)  # Mostrar traceback completo para depuración
+            
+        finally:
+            # Limpiar elementos de UI
+            progress_bar.empty()
+            status_text.empty()
 
 # Inicialización y ejecución
 if __name__ == "__main__":
