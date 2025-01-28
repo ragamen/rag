@@ -44,7 +44,8 @@ if st.button("Buscar Documentos Similares"):
                 "id": item["id"],
                 "contenido": item["contenido"],
                 "metadata": item.get("metadata", {}),
-                "similarity": 0.7  # Valor por defecto para compatibilidad
+                "similarity": 0.7,  # Valor por defecto para compatibilidad
+                "fuente_id": item.get("fuente_id")  # Incluir fuente_id
             })
 
         # 5. Combinar y ordenar resultados
@@ -62,6 +63,7 @@ if st.button("Buscar Documentos Similares"):
                 st.write(f"**ID:** {result['id']}")
                 st.write(f"**Contenido:** {result['contenido']}")
                 st.write(f"**Similitud:** {result['similarity']:.4f}")
+                st.write(f"**Fuente ID:** {result.get('fuente_id', 'N/A')}")  # Mostrar fuente_id
                 st.write(f"**Metadatos:** {result['metadata']}")
                 st.write("---")
         else:
