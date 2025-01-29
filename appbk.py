@@ -1,7 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import warnings
-
+from typing import Tuple, List, Dict
 from PyPDF2 import PdfReader
+from fpdf import FPDF
 warnings.filterwarnings("ignore", category=UserWarning, message="Tried to instantiate class '__path__._path'")
 import json
 import requests
@@ -545,12 +547,10 @@ class ChatManager:
         except Exception as e:
             st.error(f"Error en búsqueda híbrida: {str(e)}")
             return []
-# Versión CORREGIDA (app.py)
-    def generate_response(self, query, results):
-        try:
-            if not results:
-                return "No se encontraron resultados relevantes.", []
+    # Versión CORREGIDA (app.py)
 
+    def generate_response(self, query: str, results: List[Dict]) -> Tuple[str, List[Dict]]:
+        try:
             # Paso 1: Procesar metadatos y construir contexto
             source_map = {}  # (autor, título, año) -> {datos}
             context_parts = []
@@ -558,11 +558,9 @@ class ChatManager:
 
             for res in results:
                 meta = res.get('metadata', {})
-
-
                 author = meta.get('author', 'Desconocido')
-                title = meta.get('source', 'Sin título yy')
-                categoria = meta.get('categoria', 'Sin categoria')
+                title = meta.get('source', 'Sin título')
+                categoria = meta.get('categoria', 'Sin categoría')
                 year = meta.get('year', 'N/A')
 
                 key = (author, title, categoria, year)
@@ -599,31 +597,45 @@ class ChatManager:
             Responde usando citas como [n], donde [n] corresponde a la fuente del contexto.
 
             **Contexto:**
-            { formatted_context }
+            {formatted_context}
             """
 
             # Paso 3: Generar respuesta con el modelo
-            response = requests.post(
-                "https://api.deepseek.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "deepseek-chat",
-                    "messages": [
+            try:
+                response = requests.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": system_prompt
+                            },
+                            {
+                                "role": "user",
+                                "content": query
+                            }
+                        ],
+                        "temperature": 0.2  # Baja temperatura para reducir la inventiva
+                    },
+                    timeout=10  # Tiempo de espera para la solicitud
+                )
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                # Si hay un error de conexión o tiempo de espera, simular una respuesta JSON
+                response = {
+                    "choices": [
                         {
-                            "role": "system",
-                            "content": system_prompt
-                        },
-                        {
-                            "role": "user",
-                            "content": query
+                            "message": {
+                                "content": "Estamos en mantenimiento. Por favor, inténtalo de nuevo más tarde."
+                            }
                         }
-                    ],
-                    "temperature": 0.2  # Baja temperatura para reducir la inventiva
+                    ]
                 }
-            )
+                return response["choices"][0]["message"]["content"], []
 
             # Paso 4: Formatear fuentes finales
             formatted_sources = []
@@ -648,12 +660,11 @@ class ChatManager:
                 # Convertir [n] a (n) para un formato más legible
                 response_text = re.sub(r'\[(\d+)\]', r'(\1)', response_text)
                 return response_text, formatted_sources
-                
+                    
             raise Exception(f"API Error: {response.status_code}")
-                
+                    
         except Exception as e:
             return f"Error: {str(e)}", []
-
 
 
 
@@ -771,104 +782,127 @@ class DeepSeekUI:
                 st.rerun()
 
 # Versión CORREGIDA (app.py)
-    def _render_message(self, msg):
+  
+
+
+    # Definir la función para renderizar mensajes
+    def _render_message(self,msg):
         with st.container():
-            if msg['type'] == 'user':
-                st.markdown(f"""
+            user_styles = {
+                "background": "#e3f2fd",
+                "label_bg": "#2196F3",
+                "label_text": "👤 Tú"
+            }
+            assistant_styles = {
+                "background": "#f0f4c3",
+                "label_bg": "#8bc34a",
+                "label_text": "🤖 Asistente"
+            }
+
+            styles = user_styles if msg['type'] == 'user' else assistant_styles
+
+            # Contenido del mensaje
+            st.markdown(f"""
+            <div style='
+                margin: 1rem 0; 
+                padding: 1.5rem;
+                background: {styles["background"]};
+                border-radius: 10px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                position: relative;
+            '>
                 <div style='
-                    margin: 1rem 0; 
-                    padding: 1.5rem;
-                    background: #e3f2fd;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                    position: relative;
+                    position: absolute;
+                    top: -12px;
+                    left: 15px;
+                    background: {styles["label_bg"]};
+                    color: white;
+                    padding: 4px 12px;
+                    border-radius: 20px;
+                    font-size: 0.85em;
                 '>
-                    <div style='
-                        position: absolute;
-                        top: -12px;
-                        left: 15px;
-                        background: #2196F3;
-                        color: white;
-                        padding: 4px 12px;
-                        border-radius: 20px;
-                        font-size: 0.85em;
-                    '>
-                        👤 Tú
-                    </div>
-                    {msg['content']}
+                    {styles["label_text"]}
                 </div>
-                """, unsafe_allow_html=True)
+                {msg['content']}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Botón de copiar al portapapeles
+            copy_script = f"""
+            <script>
+            function copyToClipboard() {{
+                navigator.clipboard.writeText("{msg['content']}");
+                alert("Texto copiado al portapapeles");
+            }}
+            </script>
+            <button onclick="copyToClipboard()" 
+                    style="background-color: #007BFF; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; margin-top: 10px;">
+                Copiar al portapapeles
+            </button>
+            """
+            st.markdown(copy_script, unsafe_allow_html=True)
+
+            # Si hay fuentes, permitir descargar un PDF con ellas
+            if msg.get('sources'):
+                st.markdown("---")
+                st.markdown("**Fuentes consultadas:**")
                 
-            elif msg['type'] == 'assistant':
-                # Verificar si la respuesta indica falta de información
-                if should_reject_response(msg['content']) and not is_response_based_on_context(msg['content'], msg.get('context', [])):
-                    # Mostrar solo el mensaje de error sin fuentes
-                    st.markdown(f"""
-                    <div style='
-                        margin: 1rem 0; 
-                        padding: 1.5rem;
-                        background: #f0f4c3;
-                        border-radius: 10px;
-                        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                        position: relative;
-                    '>
-                        <div style='
-                            position: absolute;
-                            top: -12px;
-                            left: 15px;
-                            background: #8bc34a;
-                            color: white;
-                            padding: 4px 12px;
-                            border-radius: 20px;
-                            font-size: 0.85em;
-                        '>
-                            🤖 Asistente
-                        </div>
-                        {msg['content']}
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    # Mostrar la respuesta normal con fuentes
-                    st.markdown(f"""
-                    <div style='
-                        margin: 1rem 0; 
-                        padding: 1.5rem;
-                        background: #f0f4c3;
-                        border-radius: 10px;
-                        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                        position: relative;
-                    '>
-                        <div style='
-                            position: absolute;
-                            top: -12px;
-                            left: 15px;
-                            background: #8bc34a;
-                            color: white;
-                            padding: 4px 12px;
-                            border-radius: 20px;
-                            font-size: 0.85em;
-                        '>
-                            🤖 Asistente
-                        </div>
-                        {msg['content']}
-                    </div>
-                    """, unsafe_allow_html=True)
+                pdf_text = "Fuentes consultadas:\n\n"
+                for source in msg['sources']:
+                    source_text = f"({source['number']}) {source['author']} ({source['year']})\n{source['title']}\nPáginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}\n\n"
+                    pdf_text += source_text
                     
-                    # Mostrar fuentes si existen
+                    st.markdown(f"""
+                    <div style='margin: 5px 0; padding: 10px; 
+                        background: #f8f9fa; border-radius: 5px;
+                        border-left: 3px solid #2c3e50;'>
+                        <b>({source['number']})</b> {source['author']} ({source['year']})<br>
+                        <i>{source['title']}</i><br>
+                        Páginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    # Verificar que msg['content'] existe y no es None
+                    contenido_mensaje = msg.get('content', "Mensaje sin contenido")
+
+                    # Construir el texto del PDF con el contenido del mensaje
+                    pdf_text = f"Mensaje:\n\n{contenido_mensaje}\n\n"
+
+                    # Si hay fuentes, agregarlas al PDF
                     if msg.get('sources'):
-                        st.markdown("---")
-                        st.markdown("**Fuentes consultadas:**")
+                        pdf_text += "Fuentes consultadas:\n\n"
                         for source in msg['sources']:
-                            st.markdown(f"""
-                            <div style='margin: 5px 0; padding: 10px; 
-                                background: #f8f9fa; border-radius: 5px;
-                                border-left: 3px solid #2c3e50;'>
-                                <b>({source['number']})</b> {source['author']} ({source['year']})<br>
-                                <i>{source['title']}</i><br>
-                                Páginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}
-                            </div>
-                            """, unsafe_allow_html=True)
-    
+                            source_text = f"({source['number']}) {source['author']} ({source['year']})\n{source['title']}\nPáginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}\n\n"
+                            pdf_text += source_text                    
+                    
+            if 'pdf_text' not in locals():
+                pdf_text = "Texto predeterminado"  # O cualquier otro valor válido
+
+            pdf_bytes = generar_pdf(pdf_text)
+            st.download_button(
+                label="📄 Descargar Fuentes en PDF",
+                data=pdf_bytes,
+                file_name="fuentes.pdf",
+                mime="application/pdf"
+            )
+
+            st.title("Generar y Descargar PDF")
+
+            texto = "Este es un PDF generado en Streamlit. Se descarga al hacer clic en el botón."
+
+            st.write("Haz clic en el botón para descargar el PDF:")
+
+            pdf_bytes = generar_pdf(texto)
+
+            st.download_button(
+                label="📄 Descargar PDF",
+                data=pdf_bytes,
+                file_name="documento.pdf",
+                mime="application/pdf"
+            )                
+
+
+
+
 
 
     def _handle_user_query(self, query):
@@ -967,7 +1001,18 @@ class DeepSeekUI:
             # Limpiar elementos de UI
             progress_bar.empty()
             status_text.empty()
-
+# Función para generar contenido PDF dinámico
+def generar_pdf(texto):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(190, 10, texto)
+    
+    pdf_output = BytesIO()
+    pdf.output(pdf_output, 'F')
+    pdf_output.seek(0)  # Regresar al inicio del archivo en memoria
+    
+    return pdf_output
 def should_reject_response(response_text):
     # Lista de frases que indican que no se puede responder
     rejection_phrases = [
