@@ -10,14 +10,13 @@ cachetools==5.5.1
 certifi==2024.12.14
 charset-normalizer==3.4.1
 click==8.1.8
-colorama==0.4.6
-defusedxml==0.7.1
-deprecation==2.1.0
+configobj==5.0.9
+configparser==7.1.0
+distro==1.9.0
 docx==0.2.4
 faiss-cpu==1.9.0.post1
 filelock==3.17.0
-fonttools==4.55.6
-fpdf2==2.8.2
+fitz==0.0.1.dev2
 frozenlist==1.5.0
 fsspec==2024.12.0
 gitdb==4.0.12
@@ -30,7 +29,6 @@ hpack==4.1.0
 httpcore==1.0.7
 httpx==0.28.1
 huggingface-hub==0.27.1
-hyperframe==6.1.0
 idna==3.10
 Jinja2==3.1.5
 joblib==1.4.2
@@ -38,8 +36,8 @@ jsonpatch==1.33
 jsonpointer==3.0.0
 jsonschema==4.23.0
 jsonschema-specifications==2024.10.1
-langchain==0.3.15
-langchain-core==0.3.31
+langchain==0.3.16
+langchain-core==0.3.32
 langchain-text-splitters==0.3.5
 langsmith==0.3.2
 lxml==5.3.0
@@ -64,8 +62,7 @@ pydantic_core==2.27.2
 pydeck==0.9.1
 Pygments==2.19.1
 PyMuPDF==1.25.2
-PyPDF2==3.0.1
-pyperclip==1.9.0
+pyparsing==3.2.1
 python-dateutil==2.9.0.post0
 python-docx==1.1.2
 pytz==2024.2
