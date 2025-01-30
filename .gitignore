@@ -1,4 +1,4 @@
-
+.streamlit/secrets.toml
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,7 +6,6 @@ __pycache__/
 .Python
 build/
 dist/
-.streamlit/secrets.toml
 .env
 .venv/
 env/

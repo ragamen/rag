@@ -9,6 +9,7 @@ import json
 import requests
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from datetime import datetime
 from collections import defaultdict
 import hashlib
@@ -27,7 +28,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import re
 from supabase_manager import SupabaseManager
+from mistralai.client import MistralClient
+from mistralai.models.chat_completion import ChatMessage
 #embedder = SentenceTransformer('all-MiniLM-L6-v2')
+MISTRAL_API_KEY = "yxrklpJOVs2mhBMfi0UK74CfGpzGcbsI"  # Reemplaza con tu clave real
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"  # URL de la API de Mistral
+mistral = MistralClient(api_key=MISTRAL_API_KEY)
 try:
     # Intenta acceder a la clave secreta
     DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
@@ -549,12 +555,14 @@ class ChatManager:
             return []
     # Versión CORREGIDA (app.py)
 
+
+
     def generate_response(self, query: str, results: List[Dict]) -> Tuple[str, List[Dict]]:
         try:
             # Paso 1: Procesar metadatos y construir contexto
             source_map = {}  # (autor, título, año) -> {datos}
             context_parts = []
-            source_counter = 1  # Contador para numerar las fuentes
+            source_counter = 1  
 
             for res in results:
                 meta = res.get('metadata', {})
@@ -564,23 +572,22 @@ class ChatManager:
                 year = meta.get('year', 'N/A')
 
                 key = (author, title, categoria, year)
-                
+
                 if key not in source_map:
-                    # Extraer páginas exactas
                     pages = meta.get('exact_pages', [])
-                    if not pages:  # Si no hay páginas, usar las del documento completo
+                    if not pages:
                         pages = list(range(1, meta.get('paginas_total', 1) + 1))
-                    
+
                     source_map[key] = {
                         'number': source_counter,
                         'author': key[0],
                         'title': key[1],
                         'categoria': key[2],
                         'year': key[3],
-                        'pages': sorted(set(pages))  # Eliminar duplicados y ordenar
+                        'pages': sorted(set(pages))
                     }
                     source_counter += 1
-                    
+
                 # Construir contexto con cita
                 current_source = source_map[key]
                 context_parts.append(
@@ -589,53 +596,33 @@ class ChatManager:
                     f"{res.get('contenido', '')}"
                 )
 
-            # Paso 2: Construir el prompt con validación integrada
+            # Paso 2: Construir el prompt
             formatted_context = "\n\n".join(context_parts)
+
             system_prompt = f"""
             Utilice solo los siguientes fragmentos de contexto para responder a la pregunta al final. 
-            Si no sabe la respuesta, simplemente diga que no la sabe, no intente inventar una respuesta.
-            Responde usando citas como [n], donde [n] corresponde a la fuente del contexto.
-
+            Si no sabe la respuesta, simplemente diga que no la sabe. No invente información.
+            Responda usando citas como [n], donde [n] corresponde a la fuente del contexto.
             **Contexto:**
             {formatted_context}
             """
 
-            # Paso 3: Generar respuesta con el modelo
+            # Paso 3: Generar respuesta con Mistral
             try:
-                response = requests.post(
-                    "https://api.deepseek.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "deepseek-chat",
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": system_prompt
-                            },
-                            {
-                                "role": "user",
-                                "content": query
-                            }
-                        ],
-                        "temperature": 0.2  # Baja temperatura para reducir la inventiva
-                    },
-                    timeout=10  # Tiempo de espera para la solicitud
+                messages = [
+                    ChatMessage(role="system", content=system_prompt),
+                    ChatMessage(role="user", content=query)
+                ]
+                chat_response = mistral.chat(
+                    model="mistral-large-latest",
+                    messages=messages,
+                    temperature=0.1
                 )
-            except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
-                # Si hay un error de conexión o tiempo de espera, simular una respuesta JSON
-                response = {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "Estamos en mantenimiento. Por favor, inténtalo de nuevo más tarde."
-                            }
-                        }
-                    ]
-                }
-                return response["choices"][0]["message"]["content"], []
+                response = chat_response.choices[0].message.content  
+
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout):
+                # Simular una respuesta JSON si hay error de conexión
+                return "Estamos en mantenimiento. Por favor, inténtalo de nuevo más tarde.", []
 
             # Paso 4: Formatear fuentes finales
             formatted_sources = []
@@ -650,21 +637,25 @@ class ChatManager:
                     "pages": sorted(data['pages'])
                 })
 
-            # Paso 5: Procesar respuesta
-            if response.status_code == 200:
-                response_text = response.json()["choices"][0]["message"]["content"]
-                if should_reject_response(response_text) and not is_response_based_on_context(response_text, context_parts):
-                    response_text = "No tengo la información necesaria para responder a tu pregunta. Te recomiendo consultar un texto especializado."
-                    formatted_sources = []
+            # 🚨 **Corrección: Manejo de `response` sin `status_code`**
+            if isinstance(response, str):  
+                response_text = response  # Si `response` es un string, úsalo directamente
+            else:
+                raise Exception("La respuesta de Mistral no es válida.")
 
-                # Convertir [n] a (n) para un formato más legible
-                response_text = re.sub(r'\[(\d+)\]', r'(\1)', response_text)
-                return response_text, formatted_sources
-                    
-            raise Exception(f"API Error: {response.status_code}")
-                    
+            # Validar respuesta generada
+            if should_reject_response(response_text) and not is_response_based_on_context(response_text, context_parts):
+                response_text = "No tengo la información necesaria para responder a tu pregunta. Te recomiendo consultar un texto especializado."
+                formatted_sources = []
+
+            # Convertir [n] a (n) para un formato más legible
+            response_text = re.sub(r'\[(\d+)\]', r'(\1)', response_text)
+
+            return response_text, formatted_sources
+
         except Exception as e:
             return f"Error: {str(e)}", []
+
 
 
 
@@ -782,12 +773,11 @@ class DeepSeekUI:
                 st.rerun()
 
 # Versión CORREGIDA (app.py)
-  
 
 
-    # Definir la función para renderizar mensajes
-    def _render_message(self,msg):
+    def _render_message(self, msg):
         with st.container():
+            # Estilos para el mensaje del usuario y del asistente
             user_styles = {
                 "background": "#e3f2fd",
                 "label_bg": "#2196F3",
@@ -801,7 +791,34 @@ class DeepSeekUI:
 
             styles = user_styles if msg['type'] == 'user' else assistant_styles
 
-            # Contenido del mensaje
+            # Mostrar la pregunta (si existe)
+            if msg.get('query'):
+                st.markdown(f"""
+                <div style='
+                    margin: 1rem 0; 
+                    padding: 1.5rem;
+                    background: {styles["background"]};
+                    border-radius: 10px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                    position: relative;
+                '>
+                    <div style='
+                        position: absolute;
+                        top: -12px;
+                        left: 15px;
+                        background: {styles["label_bg"]};
+                        color: white;
+                        padding: 4px 12px;
+                        border-radius: 20px;
+                        font-size: 0.85em;
+                    '>
+                        {styles["label_text"]}
+                    </div>
+                    <strong>Pregunta:</strong> {msg['query']}
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Mostrar la respuesta
             st.markdown(f"""
             <div style='
                 margin: 1rem 0; 
@@ -823,35 +840,25 @@ class DeepSeekUI:
                 '>
                     {styles["label_text"]}
                 </div>
-                {msg['content']}
+                <strong>Respuesta:</strong> {msg['content']}
             </div>
             """, unsafe_allow_html=True)
 
-            # Botón de copiar al portapapeles
-            copy_script = f"""
-            <script>
-            function copyToClipboard() {{
-                navigator.clipboard.writeText("{msg['content']}");
-                alert("Texto copiado al portapapeles");
-            }}
-            </script>
-            <button onclick="copyToClipboard()" 
-                    style="background-color: #007BFF; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; margin-top: 10px;">
-                Copiar al portapapeles
-            </button>
-            """
-            st.markdown(copy_script, unsafe_allow_html=True)
-
-            # Si hay fuentes, permitir descargar un PDF con ellas
+            # Mostrar las fuentes (si existen)
             if msg.get('sources'):
                 st.markdown("---")
                 st.markdown("**Fuentes consultadas:**")
-                
-                pdf_text = "Fuentes consultadas:\n\n"
+
+                # Preparar el texto para el PDF y el clipboard
+                pdf_text = f"Pregunta:\n{msg.get('query', 'N/A')}\n\n"
+                pdf_text += f"Respuesta:\n{msg['content']}\n\n"
+                pdf_text += "Fuentes consultadas:\n\n"
+
                 for source in msg['sources']:
                     source_text = f"({source['number']}) {source['author']} ({source['year']})\n{source['title']}\nPáginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}\n\n"
                     pdf_text += source_text
-                    
+
+                    # Mostrar cada fuente en la interfaz
                     st.markdown(f"""
                     <div style='margin: 5px 0; padding: 10px; 
                         background: #f8f9fa; border-radius: 5px;
@@ -861,49 +868,42 @@ class DeepSeekUI:
                         Páginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}
                     </div>
                     """, unsafe_allow_html=True)
-                    # Verificar que msg['content'] existe y no es None
-                    contenido_mensaje = msg.get('content', "Mensaje sin contenido")
 
-                    # Construir el texto del PDF con el contenido del mensaje
-                    pdf_text = f"Mensaje:\n\n{contenido_mensaje}\n\n"
+                # Generar PDF y botón de descarga
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    pdf_bytes = generar_pdf(pdf_text)
+                    st.download_button(
+                        label="📄 Descargar Fuentes en PDF",
+                        data=pdf_bytes,
+                        file_name="fuentes.pdf",
+                        mime="application/pdf",
+                        key=f"download_pdf_{msg['type']}"
+                    )
 
-                    # Si hay fuentes, agregarlas al PDF
-                    if msg.get('sources'):
-                        pdf_text += "Fuentes consultadas:\n\n"
-                        for source in msg['sources']:
-                            source_text = f"({source['number']}) {source['author']} ({source['year']})\n{source['title']}\nPáginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}\n\n"
-                            pdf_text += source_text                    
-                    
-            if 'pdf_text' not in locals():
-                pdf_text = "Texto predeterminado"  # O cualquier otro valor válido
-
-            pdf_bytes = generar_pdf(pdf_text)
-            st.download_button(
-                label="📄 Descargar Fuentes en PDF",
-                data=pdf_bytes,
-                file_name="fuentes.pdf",
-                mime="application/pdf"
-            )
-
-            st.title("Generar y Descargar PDF")
-
-            texto = "Este es un PDF generado en Streamlit. Se descarga al hacer clic en el botón."
-
-            st.write("Haz clic en el botón para descargar el PDF:")
-
-            pdf_bytes = generar_pdf(texto)
-
-            st.download_button(
-                label="📄 Descargar PDF",
-                data=pdf_bytes,
-                file_name="documento.pdf",
-                mime="application/pdf"
-            )                
-
-
-
-
-
+                with col2:
+                    # Botón para copiar al portapapeles usando JavaScript
+                    copy_script = f"""
+                    <script>
+                    function copyToClipboard() {{
+                        const text = `{pdf_text}`;
+                        navigator.clipboard.writeText(text).then(function() {{
+                            alert("Texto copiado al portapapeles");
+                        }}).catch(function(error) {{
+                            alert("Error al copiar el texto: " + error);
+                        }});
+                    }}
+                    </script>
+                    <button onclick="copyToClipboard()" 
+                            style="background-color: #007BFF; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; margin-top: 10px;">
+                        📋 Copiar al portapapeles
+                    </button>
+                    """
+                    # Inyectar el script y el botón en Streamlit
+                    st.components.v1.html(copy_script, height=60)
+                
+                                
 
     def _handle_user_query(self, query):
         try:
@@ -1002,7 +1002,11 @@ class DeepSeekUI:
             progress_bar.empty()
             status_text.empty()
 # Función para generar contenido PDF dinámico
+
+
 def generar_pdf(texto):
+    text1 = limpiar_texto(texto)
+    texto = text1.replace('\n', ' ')
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
@@ -1013,6 +1017,18 @@ def generar_pdf(texto):
     pdf_output.seek(0)  # Regresar al inicio del archivo en memoria
     
     return pdf_output
+def limpiar_texto(texto):
+    reemplazos = {
+        "≥": ">=",  
+        "≤": "<=",
+        "–": "-",  
+        "•": "*",  
+        "→": "->"  
+    }
+    for char, replacement in reemplazos.items():
+        texto = texto.replace(char, replacement)
+    return texto
+
 def should_reject_response(response_text):
     # Lista de frases que indican que no se puede responder
     rejection_phrases = [
