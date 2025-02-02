@@ -929,6 +929,7 @@ class DeepSeekUI:
             # Actualizar historial
             st.session_state.state.chat_history.append({
                 'type': 'assistant',
+                'query' : query,
                 'content': response,
                 'sources': sources
             })
