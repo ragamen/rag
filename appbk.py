@@ -1005,11 +1005,11 @@ class DeepSeekUI:
 def generar_pdf(texto):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Arial", size=12)
+    pdf.set_font("Helvetica", size=12)
     pdf.multi_cell(190, 10, texto)
     
     pdf_output = BytesIO()
-    pdf.output(pdf_output, 'F')
+    pdf.output(pdf_output)
     pdf_output.seek(0)  # Regresar al inicio del archivo en memoria
     
     return pdf_output

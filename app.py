@@ -1,10 +1,16 @@
+# app con la API Mistral
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import warnings
+from typing import Tuple, List, Dict
+from PyPDF2 import PdfReader
+from fpdf import FPDF
 warnings.filterwarnings("ignore", category=UserWarning, message="Tried to instantiate class '__path__._path'")
 import json
 import requests
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from datetime import datetime
 from collections import defaultdict
 import hashlib
@@ -23,16 +29,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import re
 from supabase_manager import SupabaseManager
+from mistralai.client import MistralClient
+from mistralai.models.chat_completion import ChatMessage
 #embedder = SentenceTransformer('all-MiniLM-L6-v2')
-try:
-    # Intenta acceder a la clave secreta
-    DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
-    #st.write(f"Tu clave API es: {DEEPSEEK_API_KEY}")
-except KeyError:
-    st.error("La clave API no está configurada. Por favor, verifica el archivo secrets.toml.")
-
-#DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-# st.error(f"Clave Api key {DEEPSEEK_API_KEY}")
+MISTRAL_API_KEY = st.secrets["MISTRAL_API_KEY"]  # Reemplaza con tu clave real
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"  # URL de la API de Mistral
+mistral = MistralClient(api_key=MISTRAL_API_KEY)
 
 # Configuración inicial
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
@@ -218,14 +220,21 @@ class DocumentProcessor:
                 raise ValueError("Documento sin texto legible o demasiado corto")
 
             # Insertar en tabla fuentes
-            metadata = self._extract_metadata(file)
+            #metadata = self._extract_metadata(file)
+            metadata, page_count = get_pdf_page(file)
+            fecha_creacion = metadata.get("/CreationDate", "")
+            if fecha_creacion.startswith("D:"):  # Verifica si es una fecha en formato PDF
+               anio_publicacion = int(fecha_creacion[2:6])  # Extrae el año
+            else:
+               anio_publicacion = 5000
+
             fuente_id = st.session_state.state.supabase.insert_fuente(
                 metadata={
-                    "title": metadata.get("title", file.name),
-                    "author": metadata.get("author", "Desconocido"),
-                    "paginas_total": len(page_numbers),
-                    "anio_publicacion": datetime.now().year,
-                    "categoria": metadata.get("categoria", "General")
+                    "title": metadata.get('/Title', 'Sin título'),
+                    "author": metadata.get('/Author', 'Desconocido'),
+                    "categoria":metadata.get('/Category', 'Sin categoría'),
+                    "anio_publicacion":anio_publicacion,
+                    "paginas_total": page_count
                 },
                 content_hash=doc_hash
             )
@@ -244,13 +253,14 @@ class DocumentProcessor:
                 # Generación de metadatos
                 doc_id = generate_doc_id(file.name, idx)
                 chunk_metadata = {
-                    "source": file.name,
+                    "source": metadata.get("/Title", "Desconocido"),
                     "pages": f"{pages[0]}-{pages[-1]}" if len(pages) > 1 else str(pages[0]),
                     "exact_pages": pages,
                     "start_char": chunk_info.get("start_char", 0),
                     "end_char": chunk_info.get("end_char", 0),
-                    "author": metadata.get("author", "Desconocido"),
-                    "year": datetime.now().year,
+                    "author": metadata.get("/Author", "Desconocido"),
+                    "categoria": metadata.get('/Category', 'Sin categoría'),
+                    "year": anio_publicacion,
                     "doc_id": doc_id
                 }
 
@@ -320,6 +330,8 @@ class DocumentProcessor:
                 "keywords": "",
                 "comments": ""
             }
+        
+
     def _extract_pdf_metadata(self, file):
         """Extrae metadatos de PDFs con soporte para campos vacíos."""
         try:
@@ -479,6 +491,15 @@ class DocumentProcessor:
         except Exception as e:
             st.error(f"Error generando etiquetas semánticas: {str(e)}")
             return []
+        
+
+def get_pdf_page(file):
+    # Abre el archivo PDF
+    reader = PdfReader(file)
+    page_count = len(reader.pages)
+    # Obtiene los metadatos estándar
+    metadata = reader.metadata
+    return metadata, page_count
             
 # Clase ChatManager
 class ChatManager:
@@ -524,40 +545,41 @@ class ChatManager:
         except Exception as e:
             st.error(f"Error en búsqueda híbrida: {str(e)}")
             return []
-# Versión CORREGIDA (app.py)
-    def generate_response(self, query, results):
-        try:
-            if not results:
-                return "No se encontraron resultados relevantes.", []
+    # Versión CORREGIDA (app.py)
 
+
+
+    def generate_response(self, query: str, results: List[Dict]) -> Tuple[str, List[Dict]]:
+        try:
             # Paso 1: Procesar metadatos y construir contexto
             source_map = {}  # (autor, título, año) -> {datos}
             context_parts = []
-            source_counter = 1  # <-- Nombre de variable corregido
-            
-            for res in results:  # <-- ¡Atención a la indentación!
+            source_counter = 1  
+
+            for res in results:
                 meta = res.get('metadata', {})
-                key = (
-                    meta.get('author', 'Desconocido'),
-                    meta.get('title', 'Sin título'),
-                    meta.get('year', 'N/A')
-                )
-                
+                author = meta.get('author', 'Desconocido')
+                title = meta.get('source', 'Sin título')
+                categoria = meta.get('categoria', 'Sin categoría')
+                year = meta.get('year', 'N/A')
+
+                key = (author, title, categoria, year)
+
                 if key not in source_map:
-                    # Extraer páginas exactas
                     pages = meta.get('exact_pages', [])
-                    if not pages:  # Si no hay páginas, usar las del documento completo
+                    if not pages:
                         pages = list(range(1, meta.get('paginas_total', 1) + 1))
-                    
+
                     source_map[key] = {
-                        'number': source_counter,  # <-- Usar source_counter
+                        'number': source_counter,
                         'author': key[0],
                         'title': key[1],
-                        'year': key[2],
-                        'pages': sorted(set(pages))  # Eliminar duplicados y ordenar
+                        'categoria': key[2],
+                        'year': key[3],
+                        'pages': sorted(set(pages))
                     }
-                    source_counter += 1  # <-- Incrementar contador
-                    
+                    source_counter += 1
+
                 # Construir contexto con cita
                 current_source = source_map[key]
                 context_parts.append(
@@ -566,28 +588,35 @@ class ChatManager:
                     f"{res.get('contenido', '')}"
                 )
 
-            # Paso 2: Generar respuesta con el modelo (FUERA del bucle for)
-            response = requests.post(
-                "https://api.deepseek.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "deepseek-chat",
-                    "messages": [{
-                        "role": "system",
-                        "content": "Contexto con citas entre corchetes:\n"  # Parte 1
-                                + "\n\n".join(context_parts)  # Parte 2 
-                                + "\nResponde usando citas como [n]."  # Parte 3
-                    }, {
-                        "role": "user",
-                        "content": query
-                    }]
-                }
-            )
+            # Paso 2: Construir el prompt
+            formatted_context = "\n\n".join(context_parts)
 
-            # Paso 3: Formatear fuentes finales
+            system_prompt = f"""
+            Utilice solo los siguientes fragmentos de contexto para responder a la pregunta al final. 
+            Si no sabe la respuesta, simplemente diga que no la sabe. No invente información.
+            Responda usando citas como [n], donde [n] corresponde a la fuente del contexto.
+            **Contexto:**
+            {formatted_context}
+            """
+
+            # Paso 3: Generar respuesta con Mistral
+            try:
+                messages = [
+                    ChatMessage(role="system", content=system_prompt),
+                    ChatMessage(role="user", content=query)
+                ]
+                chat_response = mistral.chat(
+                    model="mistral-large-latest",
+                    messages=messages,
+                    temperature=0.1
+                )
+                response = chat_response.choices[0].message.content  
+
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout):
+                # Simular una respuesta JSON si hay error de conexión
+                return "Estamos en mantenimiento. Por favor, inténtalo de nuevo más tarde.", []
+
+            # Paso 4: Formatear fuentes finales
             formatted_sources = []
             for key in sorted(source_map.keys(), key=lambda x: source_map[x]['number']):
                 data = source_map[key]
@@ -595,21 +624,33 @@ class ChatManager:
                     "number": data['number'],
                     "author": key[0],
                     "title": key[1],
-                    "year": key[2],
+                    "categoria": key[2],
+                    "year": key[3],
                     "pages": sorted(data['pages'])
                 })
 
-            # Procesar respuesta
-            if response.status_code == 200:
-                response_text = response.json()["choices"][0]["message"]["content"]
-                # Convertir [n] a (n)
-                response_text = re.sub(r'\[(\d+)\]', r'(\1)', response_text)
-                return response_text, formatted_sources
-                
-            raise Exception(f"API Error: {response.status_code}")
-                
+            # 🚨 **Corrección: Manejo de `response` sin `status_code`**
+            if isinstance(response, str):  
+                response_text = response  # Si `response` es un string, úsalo directamente
+            else:
+                raise Exception("La respuesta de Mistral no es válida.")
+
+            # Validar respuesta generada
+            if should_reject_response(response_text) and not is_response_based_on_context(response_text, context_parts):
+                response_text = "No tengo la información necesaria para responder a tu pregunta. Te recomiendo consultar un texto especializado."
+                formatted_sources = []
+
+            # Convertir [n] a (n) para un formato más legible
+            response_text = re.sub(r'\[(\d+)\]', r'(\1)', response_text)
+
+            return response_text, formatted_sources
+
         except Exception as e:
-            return f"Error: {str(e)}", [] 
+            return f"Error: {str(e)}", []
+
+
+
+
         
 # Interfaz de usuario mejorada
 class DeepSeekUI:
@@ -724,14 +765,31 @@ class DeepSeekUI:
                 st.rerun()
 
 # Versión CORREGIDA (app.py)
+
+
     def _render_message(self, msg):
         with st.container():
-            if msg['type'] == 'user':
+            # Estilos para el mensaje del usuario y del asistente
+            user_styles = {
+                "background": "#e3f2fd",
+                "label_bg": "#2196F3",
+                "label_text": "👤 Tú"
+            }
+            assistant_styles = {
+                "background": "#f0f4c3",
+                "label_bg": "#8bc34a",
+                "label_text": "🤖 Asistente"
+            }
+
+            styles = user_styles if msg['type'] == 'user' else assistant_styles
+
+            # Mostrar la pregunta (si existe)
+            if msg.get('query'):
                 st.markdown(f"""
                 <div style='
                     margin: 1rem 0; 
                     padding: 1.5rem;
-                    background: #e3f2fd;
+                    background: {styles["background"]};
                     border-radius: 10px;
                     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
                     position: relative;
@@ -740,39 +798,110 @@ class DeepSeekUI:
                         position: absolute;
                         top: -12px;
                         left: 15px;
-                        background: #2196F3;
+                        background: {styles["label_bg"]};
                         color: white;
                         padding: 4px 12px;
                         border-radius: 20px;
                         font-size: 0.85em;
                     '>
-                        👤 Tú
+                        {styles["label_text"]}
                     </div>
-                    {msg['content']}
+                    <strong>Pregunta:</strong> {msg['query']}
                 </div>
                 """, unsafe_allow_html=True)
+
+            # Mostrar la respuesta
+            st.markdown(f"""
+            <div style='
+                margin: 1rem 0; 
+                padding: 1.5rem;
+                background: {styles["background"]};
+                border-radius: 10px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                position: relative;
+            '>
+                <div style='
+                    position: absolute;
+                    top: -12px;
+                    left: 15px;
+                    background: {styles["label_bg"]};
+                    color: white;
+                    padding: 4px 12px;
+                    border-radius: 20px;
+                    font-size: 0.85em;
+                '>
+                    {styles["label_text"]}
+                </div>
+                <strong>Respuesta:</strong> {msg['content']}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Mostrar las fuentes (si existen)
+            if msg.get('sources'):
+                st.markdown("---")
+                st.markdown("**Fuentes consultadas:**")
+
+                # Preparar el texto para el PDF y el clipboard
+                pdf_text = f"Pregunta:\n{msg.get('query', 'N/A')}\n\n"
+                pdf_text += f"Respuesta:\n{msg['content']}\n\n"
+                pdf_text += "Fuentes consultadas:\n\n"
+
+                for source in msg['sources']:
+                    source_text = f"({source['number']}) {source['author']} ({source['year']})\n{source['title']}\nPáginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}\n\n"
+                    pdf_text += source_text
+
+                    # Mostrar cada fuente en la interfaz
+                    st.markdown(f"""
+                    <div style='margin: 5px 0; padding: 10px; 
+                        background: #f8f9fa; border-radius: 5px;
+                        border-left: 3px solid #2c3e50;'>
+                        <b>({source['number']})</b> {source['author']} ({source['year']})<br>
+                        <i>{source['title']}</i><br>
+                        Páginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # Generar PDF y botón de descarga
+                col1, col2 = st.columns(2)
                 
-            elif msg['type'] == 'assistant':
-                # Mostrar respuesta principal
-                st.markdown(msg['content'])
+                with col1:
+                    pdf_bytes = generar_pdf(pdf_text)
+                    st.download_button(
+                        label="📄 Descargar Fuentes en PDF",
+                        data=pdf_bytes,
+                        file_name="fuentes.pdf",
+                        mime="application/pdf",
+                        key=f"download_pdf_{msg['type']}"
+                    )
+
+                with col2:
+                    # Botón para copiar al portapapeles usando JavaScript
+                    copy_script = f"""
+                    <script>
+                    function copyToClipboard() {{
+                        const text = `{pdf_text}`;
+                        navigator.clipboard.writeText(text).then(function() {{
+                            alert("Texto copiado al portapapeles");
+                        }}).catch(function(error) {{
+                            alert("Error al copiar el texto: " + error);
+                        }});
+                    }}
+                    </script>
+                    <button onclick="copyToClipboard()" 
+                            style="background-color: #007BFF; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; margin-top: 10px;">
+                        📋 Copiar al portapapeles
+                    </button>
+                    """
+                    # Inyectar el script y el botón en Streamlit
+                    st.components.v1.html(copy_script, height=60)
                 
-                # Mostrar fuentes si existen
-                if msg.get('sources'):
-                    st.markdown("---")
-                    st.markdown("**Fuentes consultadas:**")
-                    for source in msg['sources']:
-                        st.markdown(f"""
-                        <div style='margin: 5px 0; padding: 10px; 
-                            background: #f8f9fa; border-radius: 5px;
-                            border-left: 3px solid #2c3e50;'>
-                            <b>({source['number']})</b> {source['author']} ({source['year']})<br>
-                            <i>{source['title']}</i><br>
-                            Páginas: {', '.join(map(str, source['pages'])) if source['pages'] else 'N/A'}
-                        </div>
-                        """, unsafe_allow_html=True)
+                                
 
     def _handle_user_query(self, query):
         try:
+            st.session_state.state.chat_history = [
+            msg for msg in st.session_state.state.chat_history if msg['type'] != 'assistant'
+            ]
             # Obtener resultados de búsqueda
             results = self.chat_manager.hybrid_search(query) or []
             
@@ -792,6 +921,7 @@ class DeepSeekUI:
             # Actualizar historial
             st.session_state.state.chat_history.append({
                 'type': 'assistant',
+                'query' : query,
                 'content': response,
                 'sources': sources
             })
@@ -799,77 +929,6 @@ class DeepSeekUI:
         except Exception as e:
             st.error(f"Error procesando consulta: {str(e)}")
         
-    def highlight_text(self, text, pages):
-        """Resalta contenido con formato académico profesional"""
-        pages_str = ", ".join([f"Pág. {p}" for p in sorted(pages)]) if pages else "Pág. N/A"
-        
-        highlighted = f"""
-        <div style='
-            border-left: 2px solid #2c3e50;
-            margin: 15px 0;
-            padding: 12px 20px;
-            background: #f9f9f9;
-            position: relative;
-            font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
-        '>
-            <div style='
-                color: #2c3e50;
-                font-size: 0.85em;
-                font-weight: 600;
-                margin-bottom: 8px;
-                border-bottom: 1px solid #e0e0e0;
-                padding-bottom: 5px;
-            '>
-                <i class="fas fa-book-open" style="margin-right: 7px;"></i>
-                Referencia: {pages_str}
-            </div>
-            <div style='
-                color: #34495e;
-                line-height: 1.6;
-                font-size: 0.95em;
-                text-align: justify;
-            '>
-                {text}
-            </div>
-        </div>
-        """
-        return highlighted    
-
-    def _validate_response(self, response, context):
-        validation_prompt = f"""
-        Utilice solo los siguientes fragmentos de contexto para responder a la pregunta al final. Si la respuesta, no esta ahi, simplemente diga que no la sabe, no intente inventar una respuesta.
-        
-        **Respuesta:**
-        {response}
-        
-        **Contexto:**
-        {context}
-        
-        Proporciona una validación en formato JSON con:
-        - score (1-5)
-        - valid (true/false)
-        - reasons (lista de razones)
-        """
-        
-        validation = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "deepseek-chat",
-                "messages": [{
-                    "role": "user",
-                    "content": validation_prompt
-                }],
-                "response_format": {"type": "json_object"}
-            }
-        )
-        if validation.status_code == 200:
-            return json.loads(validation.json()["choices"][0]["message"]["content"])
-        else:
-            return {"score": 0, "valid": False, "reasons": ["Error en la validación"]}
 
     def _show_database_stats(self):
         """Muestra estadísticas clave de la base de datos"""
@@ -935,6 +994,74 @@ class DeepSeekUI:
             # Limpiar elementos de UI
             progress_bar.empty()
             status_text.empty()
+# Función para generar contenido PDF dinámico
+
+
+def generar_pdf(texto):
+    text1 = limpiar_texto(texto)
+    texto = text1.replace('\n', ' ')
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=12)
+    pdf.multi_cell(190, 10, texto)
+    
+    pdf_output = BytesIO()
+    pdf.output(pdf_output)
+    pdf_output.seek(0)  # Regresar al inicio del archivo en memoria
+    
+    return pdf_output
+def limpiar_texto(texto):
+    reemplazos = {
+        "≥": ">=",  
+        "≤": "<=",
+        "–": "-",  
+        "•": "*",  
+        "→": "->"  
+    }
+    for char, replacement in reemplazos.items():
+        texto = texto.replace(char, replacement)
+    return texto
+
+def should_reject_response(response_text):
+    # Lista de frases que indican que no se puede responder
+    rejection_phrases = [
+        "no tengo información específica",
+        "no sé",
+        "no tengo esa información",
+        "no puedo responder",
+        "consulte fuentes especializadas",
+        "no está en el contexto",
+        "no tengo datos sobre eso"
+    ]
+    
+    # Verificar si alguna de las frases está en la respuesta
+    for phrase in rejection_phrases:
+        if phrase in response_text.lower():
+            return True
+    return False
+
+def is_response_based_on_context(response_text, context_parts):
+    # Verificar si alguna parte del contexto está en la respuesta
+    for part in context_parts:
+        if part.lower() in response_text.lower():
+            return True
+    return False
+
+
+def is_response_based_on_context(response_text, context_parts):
+    # Verificar si alguna parte del contexto está en la respuesta
+    for part in context_parts:
+        if part.lower() in response_text.lower():
+            return True
+    return False
+
+def is_valid_source(source):
+    # Verificar si la fuente tiene un título, autor y año válidos
+    return (
+        source.get('title') and source.get('title').strip().lower() != "sin título"
+        and source.get('author')
+        and source.get('year') and isinstance(source.get('year'), int) and source['year'] <= datetime.now().year
+    )
 
 # Inicialización y ejecución
 if __name__ == "__main__":
